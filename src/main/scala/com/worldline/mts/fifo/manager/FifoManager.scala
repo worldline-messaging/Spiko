@@ -4,7 +4,6 @@ package com.worldline.mts.fifo.manager
 import akka.actor._
 import akka.pattern.pipe
 import akka.pattern.ask
-import akka.persistence._
 import scala.concurrent.Future
 import com.typesafe.config.Config
 import scala.util.{Failure,Success}
@@ -33,38 +32,32 @@ class ReachMaxSizeException (qName:String) extends Exception
 class EmptyQueueException (qName:String) extends Exception
 
 
-abstract class Fifo (tsconfig: Config) {
+//TODO: Decide if an instance continues to manage all the fifo. Or an instance manages a fifo.
+abstract class Fifo[T] (qName: String,tsconfig: Config) {
 	def initialize (): Unit
-	def createQueue(qName: String, qSize:Int): Future[Unit]
-	def dropQueue(qName: String): Future[Unit]
-	def getSize(qName: String): Long
-	def addMessage(qName: String, message:Array[Byte]): Future[Unit]
-	def pollMessage(qName: String): Future[Option[Array[Byte]]]
-	def peekMessage(qName: String): Future[Option[Array[Byte]]]
-	def removeMessage(qName: String): Future[Unit]
+	def createQueue(qSize:Int=0): Future[Unit]
+	def dropQueue(): Future[Unit]
+	def getSize(): Long
+	def addMessage(message:T): Future[Unit]
+	def pollMessage(): Future[Option[T]]
+	def peekMessage(): Future[Option[T]]
+	def removeMessage(): Future[Unit]
 	def destroy (): Unit
 }
 
 /*
  * The global FifoManager.
  * It relies on Akka (Configuration, Serialization jobs, and Actor for serializing actions)
- */
-class FifoManager extends Actor {
+ *
+class FifoManager (qName:String) extends Actor {
 	import com.worldline.mts.fifo.FifoProtocol._
 		
 	var config = context.system.settings.config.getConfig("fifo-manager")
 	
 	val clazz = config.getString("class")
 
-	val fifo = Class.forName(clazz).getConstructors()(0).newInstance(config).asInstanceOf[Fifo]
-	
-    /*
-     * Initialize the cache of the metadata
-     */
-    override def preStart() {
-		super.preStart
-		fifo.initialize
-	}
+	val fifo = Class.forName(clazz).getConstructors()(0).newInstance(qName,config).asInstanceOf[Fifo]
+	fifo.initialize
 	
     def receive: Receive = {
 	    case cmd:CreateQueue =>
@@ -223,4 +216,4 @@ object FifoExample extends App {
 	Await.result(fpoll4, Duration.Inf)
 	
 	system.shutdown()
-}
+}*/

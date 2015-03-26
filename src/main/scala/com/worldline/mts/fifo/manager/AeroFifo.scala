@@ -7,8 +7,11 @@ import com.tapad.aerospike.ScanFilter
 import com.tapad.aerospike.AerospikeClient
 import java.nio.ByteBuffer
 import scala.concurrent.Future
+import scala.concurrent.blocking
 import java.util.concurrent.ThreadFactory
 import scala.concurrent.duration.Duration
+import scala.concurrent.duration.DurationInt
+import scala.concurrent.duration.DurationLong
 import scala.collection.JavaConversions._
 import com.tapad.aerospike.ClientSettings
 import com.tapad.aerospike.DefaultValueMappings._
@@ -18,7 +21,51 @@ import com.codahale.metrics.ConsoleReporter
 import com.codahale.metrics.Meter
 import com.codahale.metrics.MetricRegistry
 import java.util.concurrent.TimeUnit
+import com.aerospike.client.AerospikeException
+import com.aerospike.client.ResultCode
+import scala.concurrent.ExecutionContext
 
+
+object AsClient {
+	private var instance:AerospikeClient = null
+	
+	var metacache: Map[String, Metadata] = Map.empty
+	
+	def getInstance (implicit config: AeroFifoConfig) = {
+	  	synchronized {
+		  	if(instance == null) {
+				val asyncTaskThreadPool = Executors.newCachedThreadPool(new ThreadFactory() {
+					override def newThread(runnable: Runnable) = {
+			                    val thread = new Thread(runnable)
+			                    thread.setDaemon(true)
+			                    thread
+			            }
+				}) 
+				instance = AerospikeClient(config.urls,new ClientSettings(blockingMode=true,selectorThreads=config.selectorThreads, taskThreadPool=asyncTaskThreadPool))
+				
+				println("Initializing metacache")
+				val metadataset = instance.namespace(config.namespace).set[String,Array[Byte]](config.metadataset)
+				
+				val bins = Seq ("head","tail","maxsize")
+				val filter = new ScanFilter [String, Map[String, Array[Byte]]] {
+					def filter(key: String, record:Map[String, Array[Byte]]): Boolean = { true }
+				}
+				val records = Await.result(metadataset.scanAllRecords[List](bins,filter),Duration.Inf)
+			    records.foreach(r => {
+			      //println (r)
+			    	val md = new Metadata(r._1, 
+			    		  ByteBuffer.wrap(r._2("head")).getLong(),
+			    		  ByteBuffer.wrap(r._2("tail")).getLong(),
+			    		  ByteBuffer.wrap(r._2("maxsize")).getInt()
+		   			)
+			    	metacache = metacache + (md.qName -> md)
+			    })
+			    println("metacache contains "+metacache.size+" fifos")
+		  	}
+		  	instance
+	  	}
+	}
+}
 
 /*
  * Akka configuration
@@ -31,56 +78,27 @@ class AeroFifoConfig(tsconfig: Config) {
 	val selectorThreads = tsconfig.getInt("selectorThreads")
 }
 
-class AeroFifo (tsconfig: Config) extends Fifo (tsconfig) {
+class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,tsconfig) {
 	
-	val config = new AeroFifoConfig(tsconfig)
+	implicit val config = new AeroFifoConfig(tsconfig)
 	
-	var metacache: Map[String, Metadata] = Map.empty
+	var metacache: Metadata = null
 	
-	//Aerospike client Initialization
-	val asyncTaskThreadPool = Executors.newCachedThreadPool(new ThreadFactory() {
-		override def newThread(runnable: Runnable) = {
-                        val thread = new Thread(runnable)
-                        thread.setDaemon(true)
-                        thread
-                }
-    })
-	val client = AerospikeClient(config.urls,new ClientSettings(blockingMode=true,selectorThreads=config.selectorThreads, taskThreadPool=asyncTaskThreadPool))
-    val metadataset = client.namespace(config.namespace).set[String,Array[Byte]](config.metadataset) //We hope that this Set should always be in the buffer cache 
-    val messageset = client.namespace(config.namespace).set[String,Array[Byte]](config.messageset)
+    val metadataset = AsClient.getInstance.namespace(config.namespace).set[String,Array[Byte]](config.metadataset) //We hope that this Set should always be in the buffer cache 
+    val messageset = AsClient.getInstance.namespace(config.namespace).set[String,Array[Byte]](config.messageset)
     
 	def initialize (): Unit = {
-		//println("initialize the cache")
-		val bins = Seq ("head","tail","maxsize")
-		val filter = new ScanFilter [String, Map[String, Array[Byte]]] {
-			def filter(key: String, record:Map[String, Array[Byte]]): Boolean = { true }
-		}
-		val records = Await.result(metadataset.scanAllRecords[List](bins,filter),Duration.Inf)
-	    records.foreach(r => {
-	      //println (r)
-	      val md = buildMetadata(r._1,r._2)
-	      metacache = metacache + (md.qName -> md)
-	    })
-	    //println("metacache="+metacache)
+		metacache = AsClient.metacache.getOrElse(qName,null)
 	}
 	
 	def destroy (): Unit = {}
-	
-	private def buildMetadata(qName:String, row:Map[String, Array[Byte]]): Metadata = {
-		new Metadata(
-			qName, 
-			ByteBuffer.wrap(row("head")).getLong(),
-			ByteBuffer.wrap(row("tail")).getLong(),
-			ByteBuffer.wrap(row("maxsize")).getInt()
-	    )
-	}
 	
 	/*
      * create a queue asynchronously.
      * update the metadata in store and in cache
      */
-	def createQueue(qName: String, qSize:Int=0): Future[Unit] = {
-		if(metacache.contains(qName)) {
+	def createQueue(qSize:Int=0): Future[Unit] = {
+		if(metacache!=null) {
 			Future.failed(new AlreadyExistingQueueException(qName))
 		} else {
 			val md = new Metadata(qName,0,0,qSize)
@@ -88,6 +106,23 @@ class AeroFifo (tsconfig: Config) extends Fifo (tsconfig) {
 		}
 	}
   
+	def exponentialBackoff(r: Int): Duration = scala.math.pow(2, r).round * 10 milliseconds
+	
+	def retry[T](f: => Future[T], backoff: (Int) => Duration = exponentialBackoff)(nMax: Int)(implicit e: ExecutionContext): Future[T] = {
+		
+		def recurRetry[T](f: => Future[T], backoff: (Int) => Duration = exponentialBackoff)(n: Int)(implicit e: ExecutionContext): Future[T] = {
+			n match {
+	        	case i if (i < nMax) => f.recoverWith{ case e: AerospikeException => {
+	        		if(e.getResultCode()==ResultCode.KEY_BUSY)
+	        			println("Retry "+(n+1)+" in "+backoff(n+1).toMillis+" milliseconds");blocking {Thread.sleep(backoff(n+1).toMillis)};recurRetry(f,backoff)(n + 1)}
+	        	}
+	        	case _ => f
+			}   
+		}
+		
+		recurRetry(f, backoff)(0)
+	}
+	
 	/*
 	 * save the metadata in store and in cache for a queue
 	 */
@@ -97,9 +132,15 @@ class AeroFifo (tsconfig: Config) extends Fifo (tsconfig) {
 		    "tail" 		-> long2bytearray(metadata.tail),
 		    "maxsize" 	-> int2bytearray(metadata.maxSize)
 		)
-		//println("create metadata "+bins+" for fifo "+metadata.qName)
-		metadataset.putBins(metadata.qName, bins) andThen { case _ =>
-			metacache = metacache + (metadata.qName -> metadata)
+
+		//println("Trying to save metadata :"+metadata )
+		val f = retry {
+		  //println("Trying to save metadata 2:"+metadata )
+		  metadataset.putBins(metadata.qName, bins)
+		} (3)
+		
+		f map { case _ =>
+			metacache = metadata
 			//println("metadata="+metadata)
 		}
 	}
@@ -107,12 +148,12 @@ class AeroFifo (tsconfig: Config) extends Fifo (tsconfig) {
 	/*
 	 * delete the metadata from store and cache for a queue
 	 */
-	def dropQueue(qName: String): Future[Unit] = {
-		if(!metacache.contains(qName)) {
+	def dropQueue(): Future[Unit] = {
+		if(metacache==null) {
 			Future.failed(new NotExistingQueueException(qName))
 		} else {
-			metadataset.delete(qName) andThen { case _ =>
-				metacache = metacache - qName
+			metadataset.delete(qName) map { case _ =>
+				metacache = null
 			}
 		}
 	}
@@ -120,12 +161,11 @@ class AeroFifo (tsconfig: Config) extends Fifo (tsconfig) {
 	/*
 	 * retrieve the size of a queue from the metadata in cache
 	 */
-	def getSize(qName: String): Long = {
-		if(!metacache.contains(qName)) {
+	def getSize(): Long = {
+		if(metacache==null) {
 			throw new NotExistingQueueException(qName)
 		} else {
-			val md = metacache(qName)
-			md.tail-md.head
+			metacache.tail-metacache.head
 		}
 	}
 	
@@ -133,16 +173,16 @@ class AeroFifo (tsconfig: Config) extends Fifo (tsconfig) {
 	 * add a message in store for a queue
 	 * update the tail counter in the metadata
 	 */
-	def addMessage(qName: String, message:Array[Byte]): Future[Unit] = {
-		if(!metacache.contains(qName)) {
+	def addMessage(message:Array[Byte]): Future[Unit] = {
+		if(metacache==null) {
 			Future.failed(new NotExistingQueueException(qName))
 		} else {
-			val md = metacache(qName)
-			if(reachMaxSize(md))
+			if(reachMaxSize(metacache))
 				Future.failed(new ReachMaxSizeException(qName))
 			val bins : Map[String, Array[Byte]] = Map ("payload" -> message)
-			messageset.putBins(qName+"_"+(md.tail+1), bins).flatMap { _ => 
-				val md2 = new Metadata(md.qName,md.head,md.tail+1,md.maxSize)
+			messageset.putBins(qName+"_"+(metacache.tail+1), bins).flatMap { _ => 
+				val md2 = new Metadata(metacache.qName,metacache.head,metacache.tail+1,metacache.maxSize)
+				//println("just add message on"+qName+"_"+(metacache.tail+1)+"...save metadata")
 				saveMetadata(md2)
 			}
 		}
@@ -152,18 +192,18 @@ class AeroFifo (tsconfig: Config) extends Fifo (tsconfig) {
 	 * poll a message (delete) from the store for a queue
 	 * update the head counter in the metadata
 	 */
-	def pollMessage(qName: String): Future[Option[Array[Byte]]] = {
-		if(!metacache.contains(qName)) {
+	def pollMessage(): Future[Option[Array[Byte]]] = {
+		if(metacache==null) {
 			Future.failed(new NotExistingQueueException(qName))
 		} else {
-			val md = metacache(qName)
-			if(emptyFifo(md)) {
+			if(emptyFifo(metacache)) {
 				//println("Fifo is empty")
 				Future.successful(None)
 			} else {
-				val md2 = new Metadata(md.qName,md.head+1,md.tail,md.maxSize)
+				val md2 = new Metadata(metacache.qName,metacache.head+1,metacache.tail,metacache.maxSize)
+				//println("About to poll "+qName+"_"+md2.head)
 				for {
-					payload <- messageset.get(qName+"_"+(md.head+1), "payload")
+					payload <- messageset.get(qName+"_"+md2.head, "payload")
 		    		res <- saveMetadata(md2)
 				} yield payload
 			}
@@ -173,16 +213,15 @@ class AeroFifo (tsconfig: Config) extends Fifo (tsconfig) {
 	/*
 	 * peek a message (do not delete) from the store for a queue
 	 */
-	def peekMessage(qName: String): Future[Option[Array[Byte]]] = {
-		if(!metacache.contains(qName)) {
+	def peekMessage(): Future[Option[Array[Byte]]] = {
+		if(metacache==null) {
 			Future.failed(new NotExistingQueueException(qName))
 		} else {
-			val md = metacache(qName)
-			if(emptyFifo(md)) {
+			if(emptyFifo(metacache)) {
 				//println("Fifo is empty")
 				Future.successful(None)
 			} else {
-				messageset.get(qName+"_"+(md.head+1), "payload")
+				messageset.get(qName+"_"+(metacache.head+1), "payload")
 			}
 		}
 	}
@@ -191,16 +230,15 @@ class AeroFifo (tsconfig: Config) extends Fifo (tsconfig) {
 	 * delete a message from the store for a queue without read it
 	 * update the head counter in the metadata
 	 */
-	def removeMessage(qName: String): Future[Unit] = {
-		if(!metacache.contains(qName)) {
+	def removeMessage(): Future[Unit] = {
+		if(metacache==null) {
 			Future.failed(new NotExistingQueueException(qName))
 		} else {
-			val md = metacache(qName)
-			if(emptyFifo(md)) {
+			if(emptyFifo(metacache)) {
 				//println("Fifo is empty")
 				Future.failed(new EmptyQueueException(qName))
 			} else {
-				val md2 = new Metadata(md.qName,md.head+1,md.tail,md.maxSize)
+				val md2 = new Metadata(metacache.qName,metacache.head+1,metacache.tail,metacache.maxSize)
 				saveMetadata(md2)
 			}
 		}
@@ -239,39 +277,67 @@ object PerformanceApp extends App {
 	
 	var config = ConfigFactory.load().getConfig("fifo-manager")
 	
-	val fifo = new AeroFifo(config)
+	val fifo = new AeroFifo("perftest0",config)
 	fifo.initialize
 	
 	try {
-		Await.result(fifo.dropQueue("perftest0"), Duration.Inf)
+		Await.result(fifo.dropQueue(), Duration.Inf)
 	} catch {
 	  case t:Throwable => t.printStackTrace();
 	}
-	Await.result(fifo.createQueue("perftest0",-1), Duration.Inf)
+	Await.result(fifo.createQueue(), Duration.Inf)
 
-	val maxmessages = 100000
+	val maxmessages = 1000
 	println("E C R I T U R E")
 	reporter.start(10, TimeUnit.SECONDS)
-	for( i <- 1 to maxmessages) {
-		Await.result(fifo.addMessage("perftest0", String.format("%01024d", int2Integer(i)).getBytes()), Duration.Inf)
-		messagescounter.mark()
+	var i = 0
+	var f:Future[Unit] = null
+	
+	def recuradd() {
+		f = fifo.addMessage(String.format("%01024d", int2Integer(i)).getBytes())
+		f.onSuccess { case _ =>
+			i=i+1
+			messagescounter.mark()
+			if(i<maxmessages) {
+				recuradd
+			}
+		}
 	}
+	recuradd
+	
+	Thread.sleep(10000)
 	reporter.report()
 	
-	val size = fifo.getSize("perftest0")
+	val size = fifo.getSize()
 	println("size ="+size)
 	if(size!=maxmessages) throw new IllegalStateException("The size is "+size)
 	
 	println("L E C T U R E")
 	
-	for( i <- 1 to maxmessages) {
-		val n = Await.result(fifo.pollMessage("perftest0"), Duration.Inf) match {
+	def recurpoll () {
+		if(fifo.getSize > 0) {
+			fifo.pollMessage().onSuccess {
+			  	case None => throw new IllegalStateException("None message")
+				case Some(arr) => { 
+				  println("onSuccess")
+				  println(new String(arr).toInt)
+				  messagescounter.mark()
+				  recurpoll
+				}
+			}
+		}
+	}
+	recurpoll
+	
+	Thread.sleep(100000)
+	/*for( i <- 1 to maxmessages) {
+		val n = Await.result(fifo.pollMessage(), Duration.Inf) match {
 		  	case None => throw new IllegalStateException("None message")
 		  	case Some(arr) => new String(arr).toInt
 		}
 		if(i!=n) throw new IllegalStateException("Not the good number "+n)
 		messagescounter.mark()
-	}
+	}*/
 	reporter.report()
 	reporter.stop()
 	reporter.close()
