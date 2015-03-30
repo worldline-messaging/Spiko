@@ -136,7 +136,7 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
 		//println("Trying to save metadata :"+metadata )
 		val f = retry {
 		  //println("Trying to save metadata 2:"+metadata )
-		  metadataset.putBins(metadata.qName, bins)
+		  metadataset.putBins(metadata.qName, bins,Option(-1))
 		} (3)
 		
 		f map { case _ =>
@@ -203,9 +203,9 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
 				val md2 = new Metadata(metacache.qName,metacache.head+1,metacache.tail,metacache.maxSize)
 				//println("About to poll "+qName+"_"+md2.head)
 				for {
-					payload <- messageset.get(qName+"_"+md2.head, "payload")
+					record <- messageset.getandtouch(qName+"_"+md2.head, Option(60))
 		    		res <- saveMetadata(md2)
-				} yield payload
+				} yield record.get("payload")
 			}
 		}
 	}
@@ -238,8 +238,10 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
 				//println("Fifo is empty")
 				Future.failed(new EmptyQueueException(qName))
 			} else {
-				val md2 = new Metadata(metacache.qName,metacache.head+1,metacache.tail,metacache.maxSize)
-				saveMetadata(md2)
+				messageset.touch(qName+"_"+(metacache.head+1), Option(1)) flatMap { _ =>
+					val md2 = new Metadata(metacache.qName,metacache.head+1,metacache.tail,metacache.maxSize)
+					saveMetadata(md2)
+				}
 			}
 		}
 	}
@@ -267,10 +269,10 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
 
 
 object PerformanceApp extends App {
-	val metrics = new MetricRegistry()
-	val messagescounter = metrics.meter("messages")
-		
-	val reporter = ConsoleReporter.forRegistry(metrics)
+	var metrics = new MetricRegistry()
+	val messagesIn = metrics.meter("messagesIn")
+	
+	var reporter = ConsoleReporter.forRegistry(metrics)
 	    	       .convertRatesTo(TimeUnit.SECONDS)
 	    	       .convertDurationsTo(TimeUnit.MILLISECONDS)
 	    	       .build()
@@ -286,42 +288,57 @@ object PerformanceApp extends App {
 	  case t:Throwable => t.printStackTrace();
 	}
 	Await.result(fifo.createQueue(), Duration.Inf)
-
-	val maxmessages = 1000
+	val maxSize = 4096 -10
+	val maxmessages = 200000
+	val messbase = String.format("%0"+maxSize+"d", int2Integer(0))
+	    
 	println("E C R I T U R E")
 	reporter.start(10, TimeUnit.SECONDS)
-	var i = 0
+	var cpt = 0
 	var f:Future[Unit] = null
 	
 	def recuradd() {
-		f = fifo.addMessage(String.format("%01024d", int2Integer(i)).getBytes())
+		f = fifo.addMessage((messbase+String.format("%010d", int2Integer(cpt))).getBytes())
 		f.onSuccess { case _ =>
-			i=i+1
-			messagescounter.mark()
-			if(i<maxmessages) {
+			cpt=cpt+1
+			messagesIn.mark()
+			if(cpt<maxmessages) {
 				recuradd
 			}
 		}
 	}
 	recuradd
 	
-	Thread.sleep(10000)
+	while(cpt<maxmessages)
+		Thread.sleep(1000)
+		
 	reporter.report()
-	
+	reporter.stop()
+	reporter.close
+
 	val size = fifo.getSize()
 	println("size ="+size)
 	if(size!=maxmessages) throw new IllegalStateException("The size is "+size)
 	
 	println("L E C T U R E")
-	
+	metrics = new MetricRegistry()
+	val messagesOut = metrics.meter("messagesOut")
+	reporter = ConsoleReporter.forRegistry(metrics)
+	    	       .convertRatesTo(TimeUnit.SECONDS)
+	    	       .convertDurationsTo(TimeUnit.MILLISECONDS)
+	    	       .build()
+	reporter.start(10, TimeUnit.SECONDS)
+	cpt = 0
 	def recurpoll () {
 		if(fifo.getSize > 0) {
 			fifo.pollMessage().onSuccess {
 			  	case None => throw new IllegalStateException("None message")
 				case Some(arr) => { 
-				  println("onSuccess")
-				  println(new String(arr).toInt)
-				  messagescounter.mark()
+				  val cur = new String(arr).toInt
+				  if(cur-cpt!=0)
+					  throw new IllegalStateException("Invalid counter [cur="+cur+",old="+cpt+"]")
+				  cpt=cpt+1
+				  messagesOut.mark()
 				  recurpoll
 				}
 			}
@@ -329,16 +346,10 @@ object PerformanceApp extends App {
 	}
 	recurpoll
 	
-	Thread.sleep(100000)
-	/*for( i <- 1 to maxmessages) {
-		val n = Await.result(fifo.pollMessage(), Duration.Inf) match {
-		  	case None => throw new IllegalStateException("None message")
-		  	case Some(arr) => new String(arr).toInt
-		}
-		if(i!=n) throw new IllegalStateException("Not the good number "+n)
-		messagescounter.mark()
-	}*/
+	while(cpt<maxmessages)
+		Thread.sleep(1000)
 	reporter.report()
 	reporter.stop()
 	reporter.close()
+	
 }

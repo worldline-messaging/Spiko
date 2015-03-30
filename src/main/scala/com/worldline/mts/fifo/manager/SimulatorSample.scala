@@ -21,10 +21,12 @@ import scala.util.{Failure,Success}
 import akka.util.Timeout
 import scala.concurrent.Future
 import scala.annotation.tailrec
+import com.codahale.metrics.Gauge
 
 case class DeviceDisconnected()
 case class DeviceConnected()
 case class AddMessage(payload:String)
+case class SendDevice(payload:String)
 case class PurgeFifo()
 case class Awaken()
 
@@ -36,12 +38,37 @@ object Statistics {
 	private val metrics = new MetricRegistry()
 	val messagesin = metrics.meter("messagesIn")
 	val messagesout = metrics.meter("messagesOut")
+	val evicted = metrics.meter("evicted")
+	val illegalCounter0 = metrics.meter("illegalCounter0")
+	val illegalCounter2 = metrics.meter("illegalCounter2")
+	val illegalCounterOther = metrics.meter("illegalCounterOther")
+	var connectedDevices = 0
+	var stashedMessages = 0
+	
+	metrics.register("connectedDevices", new Gauge[Int]() {
+	    def getValue():Int = {
+	        connectedDevices
+	    }
+	})
+	
+	metrics.register("stashedMessages", new Gauge[Int]() {
+	    def getValue():Int = {
+	        stashedMessages
+	    }
+	})
 	
 	val reporter = ConsoleReporter.forRegistry(metrics)
 	    	       .convertRatesTo(TimeUnit.SECONDS)
 	    	       .convertDurationsTo(TimeUnit.MILLISECONDS)
 	    	       .build()
 	
+	def incrConnectedDevices {
+		connectedDevices = connectedDevices + 1
+	}
+	
+	def decrConnectedDevices {
+		connectedDevices = connectedDevices - 1
+	}
 }
 
 class CellSimulator (deviceId:String, config:Config) extends Actor with Stash {
@@ -49,33 +76,23 @@ class CellSimulator (deviceId:String, config:Config) extends Actor with Stash {
 	var oldCounter = 0
 	val fifo = new AeroFifo(deviceId,config)
 	fifo.initialize
-	try { Await.result(fifo.createQueue(),Duration.Inf) } catch { case e:Throwable =>  }
-	//Await.result(fifo.createQueue(),Duration.Inf)
+	try { Await.result(fifo.dropQueue(),Duration.Inf) } catch { case e:Throwable =>  }
+	Await.result(fifo.createQueue(),Duration.Inf)
 	
-	def receive = idle
-	
-	def idle: Receive = {
-		case DeviceConnected => {
-			println(deviceId+" reconnects in idle")
-	  	  	context.become(connected)
-		}
-	  	case DeviceDisconnected => {
-	  		println(deviceId+" disconnects in idle")
-	  	  	context.become(disconnected)
-	  	}
-	  	case Awaken =>
-	}
+	def receive = disconnected
 	
 	def connected(): Receive = {	//Le device est connecté
 		case DeviceDisconnected => {
-			println(deviceId+" disconnects in connected")
+			//println(deviceId+" disconnects in connected")
 	  	  	context.become(disconnected)
+	  	  	Statistics.decrConnectedDevices
 		}
 	  	case AddMessage(payload) =>
 	  	  	val p = sender
 	  	  	if(fifo.getSize>0) {	//Un nouveau message arrive mais la fifo est non vide
 	  	  		stash				//On sauvegarde le message en cours
-	  	  		println(deviceId+" purging in connected")
+	  	  		Statistics.stashedMessages = Statistics.stashedMessages + 1
+	  	  		//println(deviceId+" purging in connected")
     			context.become(purging) //Et on purge
     			self ! PurgeFifo
 	  	  	} else {				//Un nouveau message arrive mais la fifo est non vide
@@ -87,42 +104,67 @@ class CellSimulator (deviceId:String, config:Config) extends Actor with Stash {
 	
 	def disconnected(): Receive = { //Le device est déconnecté
     	case DeviceConnected => { 
-    		println(deviceId+" reconnects in disconnected")
+    		//println(deviceId+" reconnects in disconnected")
     		context.become(connected)
+    		Statistics.incrConnectedDevices
     	}
     	case AddMessage(payload) => //Un nouveau message arrive mais le device est deconnecté
     	  	val p = sender
-    	  	storeMessage(payload)
-    	  	Future.successful(Unit).pipeTo(p)
+    	  	storeMessage(payload).pipeTo(p)
     	case Awaken =>
   	}
 	
 	def purging(): Receive = {
 	  	case PurgeFifo =>
-	  	  val f = fifo.pollMessage
-		  f.onSuccess {
-		      case Some(payload) => {
-		    	  sendToDevice(new String(payload))
-		    	  Statistics.messagesout.mark
-		  	      if(fifo.getSize>0)
-		  	    	  self ! PurgeFifo
-		  	      else {
-		  	    	  println("Fifo is now empty")
-		  	    	  self ! DeviceConnected
-		  	      }
-		  	  }
-		  	  case None => {
-		  		  if(fifo.getSize>0)
-		  	    	  self ! PurgeFifo
-		  	      else {
-		  	    	  println("Fifo is now empty")
-		  	    	  self ! DeviceConnected
-		  	      }
-		  	  }
+	  	  if(fifo.getSize>0) {
+	  		  Await.result(fifo.pollMessage, Duration.Inf) match {
+	  		      case Some(payload) => 
+	  		      		Statistics.messagesout.mark
+	  		      		sendToDevice(new String(payload))
+	  		      		if(fifo.getSize>0)
+			  	    	  self ! PurgeFifo
+			  	    	else {
+			  	    	  //println("Fifo is now empty")
+			  	    	  self ! DeviceConnected
+			  	    	}
+	  		      case None => {
+			  		  Statistics.messagesout.mark
+			  		  Statistics.evicted.mark()
+			  		  if(fifo.getSize>0) {
+			  	    	  self ! PurgeFifo
+			  		  } else {
+			  	    	  //println("Fifo is now empty")
+			  	    	  self ! DeviceConnected
+			  	      }
+			  	  }
+	  		  }
+		  	  /*val f = fifo.pollMessage
+			  f.onSuccess {
+			      case Some(payload) => {
+			    	  Statistics.messagesout.mark
+			    	  sendToDevice(new String(payload))
+			  	      if(fifo.getSize>0)
+			  	    	  self ! PurgeFifo
+			  	      else {
+			  	    	  //println("Fifo is now empty")
+			  	    	  self ! DeviceConnected
+			  	      }
+			  	  }
+			  	  case None => {
+			  		  Statistics.messagesout.mark
+			  		  Statistics.evicted.mark()
+			  		  if(fifo.getSize>0) {
+			  	    	  self ! PurgeFifo
+			  		  } else {
+			  	    	  //println("Fifo is now empty")
+			  	    	  self ! DeviceConnected
+			  	      }
+			  	  }
+		  	  }*/
 	  	  }
-	  	  
 	  	case AddMessage(payload) =>
 	  	  	stash
+	  	  	Statistics.stashedMessages = Statistics.stashedMessages + 1
 	  	  	val p = sender
 /*	  	  	if(fifo.getSize>0) {	//Un nouveau message arrive mais la fifo est non vide
 	  	  		stash				//On sauvegarde le message en cours
@@ -133,34 +175,51 @@ class CellSimulator (deviceId:String, config:Config) extends Actor with Stash {
 	  	  	}*/
 	  	  	Future.successful(Unit).pipeTo(p)
 	  	case DeviceConnected => 	
-	  	  	println(deviceId+" is already connected")//When we purge it's because the device is connected
+	  	  	//println(deviceId+" is already connected")//When we purge it's because the device is connected
 	  	  	context.become(connected)
 	  	  	unstashAll
+	  	  	Statistics.stashedMessages = 0
 	  	case DeviceDisconnected => {
-	  		println(deviceId+" disconnects in purging")
+	  		//println(deviceId+" disconnects in purging")
 	  		context.become(disconnected)
 	  		unstashAll
+	  		Statistics.decrConnectedDevices
+	  		Statistics.stashedMessages = 0
 	  	}
 	  	case Awaken =>
 	}
 	
-	
 	def sendToDevice(payload:String) {
+		val old = oldCounter
+		val cur = payload.toInt
+		oldCounter=cur
+		if(cur-old==0) {
+			Statistics.illegalCounter0.mark()
+		} else if(cur-old==2) {
+			Statistics.illegalCounter2.mark()
+		} else if(cur-old!=1){
+			Statistics.illegalCounterOther.mark()
+		} else {
+			
+		}
 	}
 	
-	def storeMessage(payload:String) {
+	def storeMessage(payload:String):Future[Unit] = {
 		//println(payload.toInt)
-		Await.result(fifo.addMessage(payload.getBytes()),Duration.Inf)
-		Statistics.messagesin.mark
+		val f = fifo.addMessage(payload.getBytes())
+		f.onSuccess { case _ =>
+			Statistics.messagesin.mark
+		}
+		f
 	}
 }
 
 case class Device (cell:ActorRef,count:Int,connected:Boolean,lastStatus:Long,nextStatus:Int)
 
 object SimulatorSample extends App {
-	val numDevices = 100000
+	val numDevices = 1000
 	val percentConnectedDevice = 0.5
-	val numMessages = 100000000
+	val numMessages = 10000000
 	val toggleChangeStatusMin = 5000
 	val toggleChangeStatusMax = 30000
 	
@@ -170,12 +229,17 @@ object SimulatorSample extends App {
 	
 	val system = ActorSystem("fifo-example")
 	
+	val messagesize = 4096 - 10
+	
 	implicit val timeout = Timeout(5000 seconds)
+	
+	val frame = String.format("%0"+messagesize+"d", int2Integer(0))
+	
+	Statistics.connectedDevices = 0
 	
 	for( i <- 1 to numDevices) {
 		println("Initialize device "+i)
-		val device = system.actorOf(CellSimulator.props("device-"+i,config), "device-"+i)
-		device ! DeviceDisconnected
+		val device = system.actorOf(CellSimulator.props("devicell-"+i,config), "device-"+i)
 		devices = devices + (("device-"+i) -> new Device(device,0,false,
 												System.currentTimeMillis(),
 												Random.nextInt(toggleChangeStatusMax-toggleChangeStatusMin)+toggleChangeStatusMin))
@@ -187,20 +251,24 @@ object SimulatorSample extends App {
 	for( m <- 1 to numMessages) {
 		val did = (m%numDevices)+1
 		val device = devices("device-"+did)
-		Await.result(device.cell ? AddMessage(String.format("%01024d", int2Integer(m))),5000 seconds)
+		Await.result(device.cell ? AddMessage(frame+(String.format("%010d", int2Integer(device.count+1)))),Duration.Inf)
 		if(System.currentTimeMillis() >= (device.lastStatus+device.nextStatus)) {
-			println("It's time to change status for device "+did+" with "+m+" messages")
+			//println("It's time to change status for device "+did+" with "+m+" messages")
 			if(device.connected) {
+				while (Statistics.stashedMessages > 100000) {
+					Thread.sleep(1000)
+					device.cell ! DeviceConnected
+				}
 				devices = devices + (("device-"+did) -> new Device(device.cell,device.count+1,false,
 													System.currentTimeMillis(),
 													Random.nextInt(toggleChangeStatusMax-toggleChangeStatusMin)+toggleChangeStatusMin))
-				println("Device "+did+" is updated:"+devices("device-"+did))
+				//println("Device "+did+" is updated:"+devices("device-"+did))
 				device.cell ! DeviceDisconnected
 			} else {
 				devices = devices + (("device-"+did) -> new Device(device.cell,device.count+1,true,
 													System.currentTimeMillis(),
-													toggleChangeStatusMax))
-				println("Device "+did+" is updated:"+devices("device-"+did))
+													(Random.nextInt(toggleChangeStatusMax-toggleChangeStatusMin)+toggleChangeStatusMin)*2))
+				//println("Device "+did+" is updated:"+devices("device-"+did))
 				device.cell ! DeviceConnected
 			}
 		} else {
@@ -208,8 +276,8 @@ object SimulatorSample extends App {
 													device.lastStatus,
 													device.nextStatus))
 		}
-		//Thread.sleep(1)
 	}
+	
 	
 	for( i <- 1 to numDevices) {
 		val device = devices("device-"+i)
