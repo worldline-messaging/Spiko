@@ -24,6 +24,7 @@ import java.util.concurrent.TimeUnit
 import com.aerospike.client.AerospikeException
 import com.aerospike.client.ResultCode
 import scala.concurrent.ExecutionContext
+import com.tapad.aerospike.WriteSettings
 
 
 object AsClient {
@@ -76,6 +77,7 @@ class AeroFifoConfig(tsconfig: Config) {
 	val metadataset = tsconfig.getString("metadataset")
 	val messageset = tsconfig.getString("messageset")
 	val selectorThreads = tsconfig.getInt("selectorThreads")
+  val commitAll = tsconfig.getBoolean("commitAll")
 }
 
 class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,tsconfig) {
@@ -84,8 +86,10 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
 	
 	var metacache: Metadata = null
 	
-    val metadataset = AsClient.getInstance.namespace(config.namespace).set[String,Array[Byte]](config.metadataset) //We hope that this Set should always be in the buffer cache 
-    val messageset = AsClient.getInstance.namespace(config.namespace).set[String,Array[Byte]](config.messageset)
+  val wp = WriteSettings(commitAll=config.commitAll)
+  val namespace = AsClient.getInstance.namespace(config.namespace,writeSettings=wp)
+  val metadataset = namespace.set[String,Array[Byte]](config.metadataset) //We hope that this Set should always be in the buffer cache 
+  val messageset = namespace.set[String,Array[Byte]](config.messageset)
     
 	def initialize (): Unit = {
 		metacache = AsClient.metacache.getOrElse(qName,null)

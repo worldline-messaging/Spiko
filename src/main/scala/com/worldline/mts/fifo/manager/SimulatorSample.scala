@@ -217,7 +217,7 @@ class CellSimulator (deviceId:String, config:Config) extends Actor with Stash {
 case class Device (cell:ActorRef,count:Int,connected:Boolean,lastStatus:Long,nextStatus:Int)
 
 object SimulatorSample extends App {
-	val numDevices = 1000
+	val numDevices = 100000
 	val percentConnectedDevice = 0.5
 	val numMessages = 10000000
 	val toggleChangeStatusMin = 5000
@@ -229,7 +229,7 @@ object SimulatorSample extends App {
 	
 	val system = ActorSystem("fifo-example")
 	
-	val messagesize = 4096 - 10
+	val messagesize = 1536 - 10
 	
 	implicit val timeout = Timeout(5000 seconds)
 	
