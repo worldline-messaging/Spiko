@@ -1,6 +1,8 @@
-name := "FifoAeroSpike"
+name := "Spiko"
 
-version := "1.0"
+version := "0.0.1-SNAPSHOT"
+
+organization := "net.atos"
 
 scalaVersion := "2.11.4"
 
@@ -9,6 +11,8 @@ scalaVersion := "2.11.4"
 fork in run := true
 
 test in assembly := {}
+
+licenses += ("Apache-2.0", url("https://www.apache.org/licenses/LICENSE-2.0.html"))
 
 libraryDependencies ++= Seq(
 "com.typesafe.akka" %% "akka-actor" % "2.3.6" % "compile",
