@@ -25,12 +25,18 @@ import com.aerospike.client.AerospikeException
 import com.aerospike.client.ResultCode
 import scala.concurrent.ExecutionContext
 import com.tapad.aerospike.WriteSettings
+import com.tapad.aerospike.ClientSettings
+import com.tapad.aerospike.WriteSettings
+import com.tapad.aerospike.ScanFilter
 
 
+
+/**
+ * @author a140168
+ * Singleton to use only one connections pool to access Aerospike
+ */
 object AsClient {
 	private var instance:AerospikeClient = null
-	
-	var metacache: Map[String, Metadata] = Map.empty
 	
 	def getInstance (implicit config: AeroFifoConfig) = {
 	  	synchronized {
@@ -43,43 +49,37 @@ object AsClient {
 			            }
 				}) 
 				instance = AerospikeClient(config.urls,new ClientSettings(blockingMode=true,selectorThreads=config.selectorThreads, taskThreadPool=asyncTaskThreadPool))
-				
-				println("Initializing metacache")
-				val metadataset = instance.namespace(config.namespace).set[String,Array[Byte]](config.metadataset)
-				
-				val bins = Seq ("head","tail","maxsize")
-				val filter = new ScanFilter [String, Map[String, Array[Byte]]] {
-					def filter(key: String, record:Map[String, Array[Byte]]): Boolean = { true }
-				}
-				val records = Await.result(metadataset.scanAllRecords[List](bins,filter),Duration.Inf)
-			    records.foreach(r => {
-			      //println (r)
-			    	val md = new Metadata(r._1, 
-			    		  ByteBuffer.wrap(r._2("head")).getLong(),
-			    		  ByteBuffer.wrap(r._2("tail")).getLong(),
-			    		  ByteBuffer.wrap(r._2("maxsize")).getInt()
-		   			)
-			    	metacache = metacache + (md.qName -> md)
-			    })
-			    println("metacache contains "+metacache.size+" fifos")
 		  	}
 		  	instance
 	  	}
-	}
+	}  
 }
-
-/*
+ 
+/**
  * Akka configuration
  */
 class AeroFifoConfig(tsconfig: Config) {
+  //AeroSpike urls to connect to
 	val urls = tsconfig.getStringList("urls")
-	val namespace = tsconfig.getString("namespace")
+	//AeroSpike namespace containing the fifos
+  val namespace = tsconfig.getString("namespace")
+  //AeroSpike set containing the metadata
 	val metadataset = tsconfig.getString("metadataset")
+  //AeroSpike set containing the fifos
 	val messageset = tsconfig.getString("messageset")
+  //Aerospike selector number of threads
 	val selectorThreads = tsconfig.getInt("selectorThreads")
+  //Consistency level
   val commitAll = tsconfig.getBoolean("commitAll")
+  //Producer and consumer are not on the same jvm.
+  val localOnly = tsconfig.getBoolean("localOnly")
 }
 
+
+/**
+ * @author a140168
+ * Aerospike implementation of a Fifo
+ */
 class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,tsconfig) {
 	
 	implicit val config = new AeroFifoConfig(tsconfig)
@@ -90,17 +90,20 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
   val namespace = AsClient.getInstance.namespace(config.namespace,writeSettings=wp)
   val metadataset = namespace.set[String,Array[Byte]](config.metadataset) //We hope that this Set should always be in the buffer cache 
   val messageset = namespace.set[String,Array[Byte]](config.messageset)
-    
+  /* NB: The buffer cache does not work with the SSD aerospike driver. 
+   * So we have to store data in memory and on disk if we use the SSD aerospike driver  
+   */
+  
 	def initialize (): Unit = {
-		metacache = AsClient.metacache.getOrElse(qName,null)
+		Await.result(readMetadata(),Duration.Inf)
 	}
 	
 	def destroy (): Unit = {}
 	
-	/*
-     * create a queue asynchronously.
-     * update the metadata in store and in cache
-     */
+	/**
+   * create a queue asynchronously.
+   * update the metadata in store and in cache
+   */
 	def createQueue(qSize:Int=0): Future[Unit] = {
 		if(metacache!=null) {
 			Future.failed(new AlreadyExistingQueueException(qName))
@@ -110,7 +113,7 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
 		}
 	}
   
-	def exponentialBackoff(r: Int): Duration = scala.math.pow(2, r).round * 10 milliseconds
+	/*def exponentialBackoff(r: Int): Duration = scala.math.pow(2, r).round * 10 milliseconds
 	
 	def retry[T](f: => Future[T], backoff: (Int) => Duration = exponentialBackoff)(nMax: Int)(implicit e: ExecutionContext): Future[T] = {
 		
@@ -125,9 +128,9 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
 		}
 		
 		recurRetry(f, backoff)(0)
-	}
+	}*/
 	
-	/*
+	/**
 	 * save the metadata in store and in cache for a queue
 	 */
 	private def saveMetadata (metadata: Metadata): Future[Unit] = {
@@ -138,19 +141,71 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
 		)
 
 		//println("Trying to save metadata :"+metadata )
-		val f = retry {
-		  //println("Trying to save metadata 2:"+metadata )
-		  metadataset.putBins(metadata.qName, bins,Option(-1))
-		} (3)
-		
-		f map { case _ =>
-			metacache = metadata
-			//println("metadata="+metadata)
-		}
+		metadataset.putBins(metadata.qName, bins,Option(-1)) map { case _ =>
+      metacache = metadata
+      //println("metadata="+metadata)
+    }
 	}
 	
-	/*
+  /**
+   * save the head metadata in store and in cache for a queue
+   */
+  private def saveMetadataHead (metadata: Metadata): Future[Unit] = {
+    val bins : Map[String, Array[Byte]] = Map (
+        "head"    -> long2bytearray(metadata.head)
+    )
+
+    //println("Trying to save metadata :"+metadata )
+    metadataset.putBins(metadata.qName, bins,Option(-1)) map { case _ =>
+      metacache = metadata
+      //println("metadata="+metadata)
+    }
+  }
+  
+  /**
+   * save the tail metadata in store and in cache for a queue
+   */
+  private def saveMetadataTail (metadata: Metadata): Future[Unit] = {
+    val bins : Map[String, Array[Byte]] = Map (
+        "tail"    -> long2bytearray(metadata.tail)
+    )
+
+    //println("Trying to save metadata :"+metadata )
+    metadataset.putBins(metadata.qName, bins,Option(-1)) map { case _ =>
+      metacache = metadata
+      //println("metadata="+metadata)
+    }
+  }
+  
+  /**
+   * update the metadata cache from the aerospike server
+   */
+  private def readMetadata (): Future[Unit] = {
+    metadataset.getBins(qName, Seq("head","tail","maxsize")) map {
+      r => {
+        if(r.contains("head") && r.contains("tail") && r.contains("maxsize")) {
+          metacache = new Metadata(qName, 
+                ByteBuffer.wrap(r("head")).getLong(),
+                ByteBuffer.wrap(r("tail")).getLong(),
+                ByteBuffer.wrap(r("maxsize")).getInt()
+            )
+        }
+        //println("metacache has changed "+metacache)
+      }
+    }
+  }
+  
+  /**
+   * purge the queue
+   */
+  def emptyQueue(): Future[Unit] = {
+    val md = new Metadata(qName,0,0,metacache.maxSize)
+    saveMetadata(md)
+  }
+  
+	/**
 	 * delete the metadata from store and cache for a queue
+   * you have to re-create the queue if you want to re-use it.
 	 */
 	def dropQueue(): Future[Unit] = {
 		if(metacache==null) {
@@ -162,10 +217,12 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
 		}
 	}
   
-	/*
+	/**
 	 * retrieve the size of a queue from the metadata in cache
 	 */
 	def getSize(): Long = {
+    if(!config.localOnly)
+      Await.result(readMetadata(),Duration.Inf)
 		if(metacache==null) {
 			throw new NotExistingQueueException(qName)
 		} else {
@@ -173,7 +230,7 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
 		}
 	}
 	
-	/*
+	/**
 	 * add a message in store for a queue
 	 * update the tail counter in the metadata
 	 */
@@ -181,18 +238,22 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
 		if(metacache==null) {
 			Future.failed(new NotExistingQueueException(qName))
 		} else {
+      if(!config.localOnly)
+        Await.result(readMetadata(),Duration.Inf)
 			if(reachMaxSize(metacache))
 				Future.failed(new ReachMaxSizeException(qName))
-			val bins : Map[String, Array[Byte]] = Map ("payload" -> message)
-			messageset.putBins(qName+"_"+(metacache.tail+1), bins).flatMap { _ => 
-				val md2 = new Metadata(metacache.qName,metacache.head,metacache.tail+1,metacache.maxSize)
-				//println("just add message on"+qName+"_"+(metacache.tail+1)+"...save metadata")
-				saveMetadata(md2)
-			}
+      else {
+  			val bins : Map[String, Array[Byte]] = Map ("payload" -> message)
+  			messageset.putBins(qName+"_"+(metacache.tail+1), bins).flatMap { _ => 
+  				val md2 = new Metadata(metacache.qName,metacache.head,metacache.tail+1,metacache.maxSize)
+  				//println("just add message on"+qName+"_"+(metacache.tail+1)+"...save metadata")
+  				saveMetadataTail(md2)
+  			}
+      }
 		}
 	}
   
-	/*
+	/**
 	 * poll a message (delete) from the store for a queue
 	 * update the head counter in the metadata
 	 */
@@ -208,13 +269,13 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
 				//println("About to poll "+qName+"_"+md2.head)
 				for {
 					record <- messageset.getandtouch(qName+"_"+md2.head, Option(60))
-		    		res <- saveMetadata(md2)
+		    		res <- saveMetadataHead(md2)
 				} yield record.get("payload")
 			}
 		}
 	}
   
-	/*
+	/**
 	 * peek a message (do not delete) from the store for a queue
 	 */
 	def peekMessage(): Future[Option[Array[Byte]]] = {
@@ -230,7 +291,7 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
 		}
 	}
 	
-	/*
+	/**
 	 * delete a message from the store for a queue without read it
 	 * update the head counter in the metadata
 	 */
@@ -242,9 +303,9 @@ class AeroFifo (qName: String,tsconfig: Config) extends Fifo[Array[Byte]](qName,
 				//println("Fifo is empty")
 				Future.failed(new EmptyQueueException(qName))
 			} else {
-				messageset.touch(qName+"_"+(metacache.head+1), Option(1)) flatMap { _ =>
+				messageset.touch(qName+"_"+(metacache.head+1), Option(60)) flatMap { _ =>
 					val md2 = new Metadata(metacache.qName,metacache.head+1,metacache.tail,metacache.maxSize)
-					saveMetadata(md2)
+					saveMetadataHead(md2)
 				}
 			}
 		}

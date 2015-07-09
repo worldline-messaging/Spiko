@@ -17,7 +17,8 @@ licenses += ("Apache-2.0", url("https://www.apache.org/licenses/LICENSE-2.0.html
 libraryDependencies ++= Seq(
 "com.typesafe.akka" %% "akka-actor" % "2.3.6" % "compile",
 "com.tapad.scaerospike" %% "scaerospike" % "1.2.2-SNAPSHOT",
-"com.codahale.metrics" % "metrics-core" % "3.0.2"
+"com.codahale.metrics" % "metrics-core" % "3.0.2",
+"com.github.scopt" %% "scopt" % "3.2.0"
  )
  
  mergeStrategy in assembly <<= (mergeStrategy in assembly) { (old) =>
