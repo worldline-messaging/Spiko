@@ -350,7 +350,7 @@ object PerformanceApp extends App {
 	try {
 		Await.result(fifo.dropQueue(), Duration.Inf)
 	} catch {
-	  case t:Throwable => t.printStackTrace();
+	  case t:Throwable => t.printStackTrace()
 	}
 	Await.result(fifo.createQueue(), Duration.Inf)
 	val maxSize = 4096 -10
