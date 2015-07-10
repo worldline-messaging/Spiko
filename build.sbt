@@ -54,3 +54,10 @@ libraryDependencies ++= Seq(
 				"Typesafe Repo" at "http://repo.typesafe.com/typesafe/releases/",
 					"krasserm at bintray" at "http://dl.bintray.com/krasserm/maven" )
 
+publishTo <<= version { (v: String) =>
+  val nexus = "http://kazan.priv.atos.fr/nexus/"
+  if (v.trim.endsWith("SNAPSHOT"))
+    Some("snapshots" at nexus + "content/repositories/snapshots")
+  else
+    Some("releases"  at nexus + "content/repositories/releases")
+}
