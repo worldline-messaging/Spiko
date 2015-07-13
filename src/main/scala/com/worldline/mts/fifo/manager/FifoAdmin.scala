@@ -29,6 +29,10 @@ object FifoAdmin extends App {
       opt[String]('f', "fifo") action { (x, c) =>
       c.copy(fifo = Some(x)) } required() text("fifo is the fifo name")
     )
+    cmd("metadata") action { (x, c) => c.copy(command = Some("metadata")) } text("get metadata of a fifo.") children (
+      opt[String]('f', "fifo") action { (x, c) =>
+      c.copy(fifo = Some(x)) } required() text("fifo is the fifo name")
+    )
   }
   
   val params = parser.parse(args, FifoAdminParams()).getOrElse {
@@ -40,6 +44,7 @@ object FifoAdmin extends App {
     case Some("purge") => purge(params.fifo.get)
     case Some("drop") => drop(params.fifo.get)
     case Some("size") => size(params.fifo.get)
+    case Some("metadata") => metadata(params.fifo.get)
     case Some(_) => println("Invalid command")
     case None => println("Invalid command")
   }
@@ -66,5 +71,11 @@ object FifoAdmin extends App {
     val fifo = new AeroFifo(fifoName,config)
     fifo.initialize()
     println(fifo.getSize())
+  }
+  
+  def metadata(fifoName:String) {
+    val fifo = new AeroFifo(fifoName,config)
+    fifo.initialize()
+    println("[head="+fifo.metacache.head+" ,tail="+fifo.metacache.tail+" ,maxSize="+fifo.metacache.maxSize+"]")
   }
 }

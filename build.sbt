@@ -52,7 +52,8 @@ libraryDependencies ++= Seq(
 		"Thrift" at "http://people.apache.org/~rawson/repo/",
 			"Apache HBase" at "https://repository.apache.org/content/repositories/releases",
 				"Typesafe Repo" at "http://repo.typesafe.com/typesafe/releases/",
-					"krasserm at bintray" at "http://dl.bintray.com/krasserm/maven" )
+					"krasserm at bintray" at "http://dl.bintray.com/krasserm/maven", 
+						"kazan snapshots" at "http://kazan.priv.atos.fr/nexus/content/repositories/snapshots/") //use http.nonProxyHosts with kazan.priv.atos.fr
 
 publishTo <<= version { (v: String) =>
   val nexus = "http://kazan.priv.atos.fr/nexus/"
